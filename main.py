@@ -1,11 +1,118 @@
 import cv2
-import cvzone
 import streamlit as st
 import numpy as np
 import time
 from PIL import Image
-from cvzone.FaceMeshModule import FaceMeshDetector
-from cvzone.PlotModule import LivePlot
+import mediapipe as mp
+import math
+
+# Initialize MediaPipe Face Mesh
+mp_face_mesh = mp.solutions.face_mesh
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+
+# Custom FaceMeshDetector class to replace cvzone
+class FaceMeshDetector:
+    def __init__(self, maxFaces=1, staticMode=False):
+        self.maxFaces = maxFaces
+        self.face_mesh = mp_face_mesh.FaceMesh(
+            static_image_mode=staticMode,
+            max_num_faces=maxFaces,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+    
+    def findFaceMesh(self, img, draw=True):
+        imgRGB = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(imgRGB)
+        faces = []
+        
+        if results.multi_face_landmarks:
+            for face_landmarks in results.multi_face_landmarks:
+                face = []
+                for id, lm in enumerate(face_landmarks.landmark):
+                    ih, iw, ic = img.shape
+                    x, y = int(lm.x * iw), int(lm.y * ih)
+                    face.append([x, y])
+                faces.append(face)
+                
+                if draw:
+                    mp_drawing.draw_landmarks(
+                        img, face_landmarks, mp_face_mesh.FACEMESH_CONTOURS,
+                        None, mp_drawing_styles.get_default_face_mesh_contours_style())
+        
+        return img, faces
+    
+    def findDistance(self, p1, p2):
+        x1, y1 = p1
+        x2, y2 = p2
+        distance = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        return distance, [(x1 + x2) // 2, (y1 + y2) // 2]
+
+# Custom LivePlot class to replace cvzone
+class LivePlot:
+    def __init__(self, w, h, yLimit, invert=False):
+        self.yLimit = yLimit
+        self.w = w
+        self.h = h
+        self.invert = invert
+        self.xP = 0
+        self.yList = []
+        
+    def update(self, y):
+        if len(self.yList) < self.w // 20:
+            self.yList.append(y)
+        else:
+            self.yList.pop(0)
+            self.yList.append(y)
+            
+        imgPlot = np.zeros((self.h, self.w, 3), np.uint8)
+        
+        # Draw plot lines
+        for i in range(1, len(self.yList)):
+            x1 = int((i - 1) * 20)
+            x2 = int(i * 20)
+            
+            y1 = int(np.interp(self.yList[i-1], self.yLimit, [self.h, 0] if self.invert else [0, self.h]))
+            y2 = int(np.interp(self.yList[i], self.yLimit, [self.h, 0] if self.invert else [0, self.h]))
+            
+            cv2.line(imgPlot, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        
+        return imgPlot
+
+# Custom text rectangle function to replace cvzone
+def putTextRect(img, text, pos, scale=1, thickness=1, colorT=(255, 255, 255), colorR=(0, 0, 0), 
+                font=cv2.FONT_HERSHEY_SIMPLEX, offset=10, border=None, colorBorder=(0, 0, 0)):
+    ox, oy = pos
+    (w, h), _ = cv2.getTextSize(text, font, scale, thickness)
+    
+    x1, y1, x2, y2 = ox - offset, oy + offset, ox + w + offset, oy - h - offset
+    cv2.rectangle(img, (x1, y1), (x2, y2), colorR, cv2.FILLED)
+    
+    if border is not None:
+        cv2.rectangle(img, (x1, y1), (x2, y2), colorBorder, border)
+    
+    cv2.putText(img, text, (ox, oy), font, scale, colorT, thickness)
+    return img, [x1, y2, x2, y1]
+
+# Custom stack images function to replace cvzone
+def stackImages(imgArray, cols, scale):
+    rows = len(imgArray) // cols
+    
+    for x in range(0, rows):
+        for y in range(0, cols):
+            imgArray[x * cols + y] = cv2.resize(imgArray[x * cols + y], 
+                                               (0, 0), None, scale, scale)
+    
+    imageBlank = np.zeros((imgArray[0].shape[0], imgArray[0].shape[1], 3), np.uint8)
+    hor = [imageBlank] * rows
+    
+    for x in range(0, rows):
+        hor[x] = np.hstack(imgArray[x * cols:x * cols + cols])
+    
+    ver = np.vstack(hor)
+    return ver
 
 # Initialize face mesh detector (cached for performance)
 @st.cache_resource
@@ -83,9 +190,19 @@ with st.sidebar:
     if st.button("Reset Counter", key="reset_button"):
         st.session_state.detection['blink_count'] = 0
 
-# Landmark indices
-blink_landmarks = [22, 23, 24, 26, 110, 157, 158, 159, 160, 161, 162, 130, 243]
-stability_landmarks = [1, 152, 33, 263, 61, 291]  # For head movement detection
+# Landmark indices for MediaPipe (different from cvzone)
+# Eye landmarks for blink detection
+LEFT_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+RIGHT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+
+# Specific landmarks for blink ratio calculation
+LEFT_EYE_TOP = 159
+LEFT_EYE_BOTTOM = 23
+LEFT_EYE_LEFT = 130
+LEFT_EYE_RIGHT = 243
+
+# Landmarks for head stability
+stability_landmarks = [1, 152, 33, 263, 61, 291]
 
 # Initialize plot
 plotY = LivePlot(640, 360, [20, 50], invert=True)
@@ -171,29 +288,31 @@ if st.session_state.detection['running']:
             # Check head stability
             st.session_state.detection['head_stable'] = check_head_stability(face)
             
-            # Draw original landmarks
-            for id in blink_landmarks:
-                cv2.circle(img, face[id], 2, (255, 0, 255), cv2.FILLED)
+            # Draw eye landmarks
+            for id in LEFT_EYE + RIGHT_EYE:
+                if id < len(face):
+                    cv2.circle(img, tuple(face[id]), 2, (255, 0, 255), cv2.FILLED)
 
-            # Original blink detection logic
-            leftUp = face[159]
-            leftDown = face[23]
-            leftLeft = face[130]
-            leftRight = face[243]
+            # Blink detection using left eye
+            if all(id < len(face) for id in [LEFT_EYE_TOP, LEFT_EYE_BOTTOM, LEFT_EYE_LEFT, LEFT_EYE_RIGHT]):
+                leftUp = face[LEFT_EYE_TOP]
+                leftDown = face[LEFT_EYE_BOTTOM]
+                leftLeft = face[LEFT_EYE_LEFT]
+                leftRight = face[LEFT_EYE_RIGHT]
 
-            lengthVer, _ = detector.findDistance(leftUp, leftDown)
-            lengthHor, _ = detector.findDistance(leftLeft, leftRight)
+                lengthVer, _ = detector.findDistance(leftUp, leftDown)
+                lengthHor, _ = detector.findDistance(leftLeft, leftRight)
 
-            cv2.line(img, leftUp, leftDown, (0, 200, 0), 2)
-            cv2.line(img, leftLeft, leftRight, (0, 200, 0), 2)
+                cv2.line(img, tuple(leftUp), tuple(leftDown), (0, 200, 0), 2)
+                cv2.line(img, tuple(leftLeft), tuple(leftRight), (0, 200, 0), 2)
 
-            ratio = int((lengthVer / lengthHor) * 100)
-            st.session_state.detection['ratio_list'].append(ratio)
+                ratio = int((lengthVer / lengthHor) * 100) if lengthHor > 0 else 0
+                st.session_state.detection['ratio_list'].append(ratio)
 
-            if len(st.session_state.detection['ratio_list']) > 3:
-                st.session_state.detection['ratio_list'].pop(0)
+                if len(st.session_state.detection['ratio_list']) > 3:
+                    st.session_state.detection['ratio_list'].pop(0)
 
-            ratioAvg = sum(st.session_state.detection['ratio_list']) / len(st.session_state.detection['ratio_list']) if st.session_state.detection['ratio_list'] else 0
+                ratioAvg = sum(st.session_state.detection['ratio_list']) / len(st.session_state.detection['ratio_list']) if st.session_state.detection['ratio_list'] else 0
             
             # Status determination
             if not st.session_state.detection['head_stable']:
@@ -222,23 +341,23 @@ if st.session_state.detection['running']:
                 st.session_state.detection['counter'] = 0
 
             # Display blink count on image
-            cvzone.putTextRect(img, f'Blinks: {st.session_state.detection["blink_count"]}', (50, 50), 
-                              scale=1.5, thickness=2, colorR=(0, 200, 0))
-            cvzone.putTextRect(img, f'Status: {status}', (50, 100), 
-                              scale=1.0, thickness=1, 
-                              colorR=(200, 0, 0) if "BLINK" in status else (0, 200, 0))
+            img, _ = putTextRect(img, f'Blinks: {st.session_state.detection["blink_count"]}', 
+                               (50, 50), scale=1.5, thickness=2, colorR=(0, 200, 0))
+            img, _ = putTextRect(img, f'Status: {status}', (50, 100), 
+                               scale=1.0, thickness=1, 
+                               colorR=(200, 0, 0) if "BLINK" in status else (0, 200, 0))
             
             # Update plot if enabled
             if show_plot:
                 imgPlot = plotY.update(ratioAvg)
                 img = cv2.resize(img, (640, 360))
-                imgStack = cvzone.stackImages([img, imgPlot], 2, 1)
+                imgStack = stackImages([img, imgPlot], 2, 1)
             else:
                 imgStack = cv2.resize(img, (640, 360))
         else:
             imgStack = cv2.resize(img, (640, 360))
             if show_plot:
-                imgStack = cvzone.stackImages([imgStack, np.zeros((360, 640, 3), dtype=np.uint8)], 2, 1)
+                imgStack = stackImages([imgStack, np.zeros((360, 640, 3), dtype=np.uint8)], 2, 1)
             warning_placeholder.empty()
 
         # Convert to RGB for Streamlit
@@ -271,4 +390,3 @@ if st.session_state.detection['running']:
 if not st.session_state.detection['running'] and st.session_state.detection['cap'] is not None:
     st.session_state.detection['cap'].release()
     st.session_state.detection['cap'] = None
-    cv2.destroyAllWindows()
