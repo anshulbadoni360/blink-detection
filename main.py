@@ -7,6 +7,19 @@ from PIL import Image
 from cvzone.FaceMeshModule import FaceMeshDetector
 from cvzone.PlotModule import LivePlot
 
+import sys
+if sys.version_info >= (3, 13):
+    st.error("Python 3.13 is not supported. Please use Python 3.10.")
+    st.stop()
+
+try:
+    from cvzone.FaceMeshModule import FaceMeshDetector
+    from cvzone.PlotModule import LivePlot
+except ImportError as e:
+    st.error(f"Required module not found: {e}")
+    st.info("Please make sure you're using Python 3.10 and have installed all dependencies.")
+    st.stop()
+
 # Initialize face mesh detector (cached for performance)
 @st.cache_resource
 def get_detector():
